@@ -89,6 +89,8 @@ from transformer_engine.pytorch.distributed import (
 from transformer_engine.pytorch.export import is_in_onnx_export_mode
 from transformer_engine.pytorch.jit import jit_fuser, no_torch_dynamo
 from transformer_engine.pytorch.graph import is_graph_capturing
+if IS_HIP_EXTENSION:
+  from transformer_engine.pytorch.triton_kernels.triton_flash_attention_fp8_block import block_scaling_node, FIXED_BLOCK_M, FIXED_BLOCK_N
 
 
 # NVTE_DEBUG = 0/1 # disables/enables debug mode, default = 0
@@ -6838,6 +6840,21 @@ class FusedAttnFunc(torch.autograd.Function):
 
         ctx.is_input_fp8 = is_input_fp8
         ctx.is_output_fp8 = is_output_fp8
+        if(os.environ.get('USE_BLOCK_FP8_FA')=='1' and IS_HIP_EXTENSION):            
+            range_v = torch.max(torch.abs(v))
+            dtype_max = torch.finfo(torch.float8_e4m3fnuz).max
+            v_scale = dtype_max / range_v
+            q, q_scale = block_scaling_node(
+                    q, FIXED_BLOCK_M)
+            k, k_scale = block_scaling_node(
+                k, FIXED_BLOCK_N)
+            v = torch.clamp((v * v_scale), -240.,
+                                        240.).to(torch.float8_e4m3fnuz)
+            aux_ctx_tensors.append(q_scale)
+            aux_ctx_tensors.append(k_scale)
+            aux_ctx_tensors.append(v_scale)
+            assert ctx.attn_bias_type in ["no_bias", "alibi"], "attn_bias_type has to be 'no_bias' or 'alibi' when use BLOCK FP8 FA"
+
         qkvo_tensors = (q, k, v, out_save) if not ctx.fp8 else (None, None, None, None)
         ctx.save_for_backward(
             *qkvo_tensors,
