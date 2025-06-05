@@ -6853,7 +6853,6 @@ class FusedAttnFunc(torch.autograd.Function):
             aux_ctx_tensors.append(q_scale)
             aux_ctx_tensors.append(k_scale)
             aux_ctx_tensors.append(v_scale)
-            assert ctx.attn_bias_type in ["no_bias", "alibi"], "attn_bias_type has to be 'no_bias' or 'alibi' when use BLOCK FP8 FA"
 
         qkvo_tensors = (q, k, v, out_save) if not ctx.fp8 else (None, None, None, None)
         ctx.save_for_backward(
@@ -6881,7 +6880,8 @@ class FusedAttnFunc(torch.autograd.Function):
         )
         ctx.use_FAv2_bwd = use_FAv2_bwd
         ctx.deterministic = deterministic
-
+        if(os.environ.get('USE_BLOCK_FP8_FA')=='1' and IS_HIP_EXTENSION):   
+            assert ctx.attn_bias_type in ["no_bias", "alibi"], "attn_bias_type has to be 'no_bias' or 'alibi' when use BLOCK FP8 FA"
         return out_ret
 
     @staticmethod

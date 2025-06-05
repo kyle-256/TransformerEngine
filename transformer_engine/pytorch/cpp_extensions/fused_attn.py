@@ -1189,20 +1189,25 @@ def fused_attn_fwd(
         dtype_max = torch.finfo(torch.float8_e4m3fnuz).max
         v_scale = dtype_max / range_v
         p_scale = torch.finfo(torch.float8_e4m3fnuz).max
-        q1, q_scale = block_scaling_node(q, FIXED_BLOCK_M)
-        k1, k_scale = block_scaling_node(k, FIXED_BLOCK_N)
-        v1 = torch.clamp((v * v_scale), -240.0, 240.0).to(torch.float8_e4m3fnuz)
-        seqlen = q.shape[1]
+        q, q_scale = block_scaling_node(q, FIXED_BLOCK_M)
+        k, k_scale = block_scaling_node(k, FIXED_BLOCK_N)
+        v = torch.clamp((v * v_scale), -240.0, 240.0).to(torch.float8_e4m3fnuz)
         mask = None
         if attn_mask_type == "causal":
             mask = True
         else:
             mask = False
-
+        if(qkv_layout == "bshd_bshd_bshd"):
+            layout = "bshd"
+        elif(qkv_layout == "thd_thd_thd"):
+            layout = "thd"
+        else:
+            raise AssertionError("block fp8 fa support only supports layouts in [bshd_bshd_bshd, thd_thd_thd]")
+        
         output, softmax_lse, exp_scores = attention_block_forward_triton_impl(
-            q1,
-            k1,
-            v1,
+            q,
+            k,
+            v,
             p_scale,
             q_scale,
             k_scale,
@@ -1212,7 +1217,7 @@ def fused_attn_fwd(
             mask,  # casual bool
             attn_bias,
             dropout,
-            "bshd",
+            layout,
             0,  # cu_seqlens_q
             0,  # cu_seqlens_kv
             max_seqlen_q,
@@ -1457,7 +1462,12 @@ def fused_attn_bwd(
             mask = True
         else:
             mask = False
-
+        if(qkv_layout == "bshd_bshd_bshd"):
+            layout = "bshd"
+        elif(qkv_layout == "thd_thd_thd"):
+            layout = "thd"
+        else:
+            raise AssertionError("block fp8 fa support only supports layouts in [bshd_bshd_bshd, thd_thd_thd]")
         output_tensors = attention_block_backward_triton_impl(
             d_o,
             q,
@@ -1475,7 +1485,7 @@ def fused_attn_bwd(
             attn_scale,
             None,  # alibi_slopes
             mask,
-            "bshd",
+            layout,
             0,
             0,
             max_seqlen_q,
