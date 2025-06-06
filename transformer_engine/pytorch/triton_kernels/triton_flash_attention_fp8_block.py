@@ -33,12 +33,10 @@ bwd_torch_dtype: tl.constexpr = torch.float32
 # Seed the RNG so we get reproducible results for testing.
 philox_seed: tl.constexpr = 0x1BF52
 philox_offset: tl.constexpr = 0x1D4B42
-
 AUTOTUNE = os.environ.get('FLASH_ATTENTION_TRITON_AMD_AUTOTUNE',
                           '0').lower() in ('1', 'true', 'yes')
 DEBUG = os.environ.get('FLASH_ATTENTION_TRITON_AMD_DEBUG',
                        '0').lower() in ('1', 'true', 'yes')
-# DEBUG = True
 PERF = os.environ.get('FLASH_ATTENTION_TRITON_AMD_PERF',
                       '0').lower() in ('1', 'true', 'yes')
 
@@ -48,6 +46,7 @@ FIXED_BLOCK_N = 64
 
 def get_shape_from_layout(q,
                           k,
+                          v,
                           layout,
                           cu_seqlens_q=None,
                           cu_seqlens_k=None,
@@ -56,14 +55,18 @@ def get_shape_from_layout(q,
     if layout == 'bhsd':
         batch_q, nheads_q, max_seqlen_q, head_size_q = q.shape
         batch_k, nheads_k, max_seqlen_k, head_size_k = k.shape
+        batch_v, nheads_v, max_seqlen_v, head_size_v = v.shape
     elif layout == 'bshd':
         batch_q, max_seqlen_q, nheads_q, head_size_q = q.shape
         batch_k, max_seqlen_k, nheads_k, head_size_k = k.shape
+        batch_v, max_seqlen_v, nheads_v, head_size_v = v.shape
     elif layout == 'thd':
         batch_q, max_seqlen_q, nheads_q, head_size_q = len(
             cu_seqlens_q) - 1, max_seqlen_q, q.shape[1], q.shape[2]
         batch_k, max_seqlen_k, nheads_k, head_size_k = len(
             cu_seqlens_k) - 1, max_seqlen_k, k.shape[1], k.shape[2]
+        batch_v, max_seqlen_v, nheads_v, head_size_v = len(
+            cu_seqlens_k) - 1, max_seqlen_k, v.shape[1], v.shape[2]
     else:
         assert False, "Got unsupported layout."
 
@@ -71,28 +74,19 @@ def get_shape_from_layout(q,
     assert batch_q == batch_k
     assert head_size_q == head_size_k
 
-    return batch_q, nheads_q, nheads_k, head_size_q, max_seqlen_q, max_seqlen_k
+    return batch_q, nheads_q, nheads_k, head_size_q, head_size_v, max_seqlen_q, max_seqlen_k
 
 
-def get_strides_from_layout(q, k, v, o, layout):
+def get_strides_from_layout(q, layout):
     if layout == 'thd':
         q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
-        k_strides = (0, k.stride(1), k.stride(0), k.stride(2))
-        v_strides = (0, v.stride(1), v.stride(0), v.stride(2))
-        o_strides = (0, o.stride(1), o.stride(0), o.stride(2))
     elif layout == 'bhsd':
         q_strides = (q.stride(0), q.stride(1), q.stride(2), q.stride(3))
-        k_strides = (k.stride(0), k.stride(1), k.stride(2), k.stride(3))
-        v_strides = (v.stride(0), v.stride(1), v.stride(2), v.stride(3))
-        o_strides = (o.stride(0), o.stride(1), o.stride(2), o.stride(3))
     elif layout == 'bshd':
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
-        k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
-        v_strides = (v.stride(0), v.stride(2), v.stride(1), v.stride(3))
-        o_strides = (o.stride(0), o.stride(2), o.stride(1), o.stride(3))
     else:
         assert False, 'Got unsupported layout.'
-    return q_strides, k_strides, v_strides, o_strides
+    return q_strides
 
 
 def get_padded_headsize(size):
@@ -237,18 +231,53 @@ def compute_alibi_block(alibi_slope,
 
 @triton.jit
 def _attn_fwd_inner(
-        acc, l_i, m_i, q, q_descale, k_descale, p_scale: tl.constexpr,
-        USE_FP8: tl.constexpr, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stride_vk,
-        stride_bn, start_m, actual_seqlen_k, actual_seqlen_q, dropout_p,
-        philox_seed, batch_philox_offset, exp_scores_ptrs, block_min,
-        block_max, offs_n_causal, masked_blocks, n_extra_tokens, alibi_slope,
-        score_ptrs, scores_scaled_shifted_ptrs, IS_CAUSAL: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
-        BLOCK_N: tl.constexpr, OFFS_M: tl.constexpr, OFFS_N: tl.constexpr,
-        PRE_LOAD_V: tl.constexpr, MASK_STEPS: tl.constexpr,
-        ENABLE_DROPOUT: tl.constexpr, PADDED_HEAD: tl.constexpr,
-        ACTUAL_BLOCK_DMODEL: tl.constexpr, SM_SCALE: tl.constexpr,
-        USE_EXP2: tl.constexpr, RETURN_SCORES: tl.constexpr):
+    acc,
+    l_i,
+    m_i,
+    q,
+    q_descale,
+    k_descale,
+    p_scale: tl.constexpr,
+    USE_FP8: tl.constexpr,
+    k_ptrs,
+    v_ptrs,
+    bias_ptrs,
+    stride_kn,
+    stride_vk,
+    stride_bn,
+    start_m,
+    actual_seqlen_k,
+    actual_seqlen_q,
+    dropout_p,
+    philox_seed,
+    batch_philox_offset,
+    exp_scores_ptrs,
+    block_min,
+    block_max,
+    offs_n_causal,
+    masked_blocks,
+    n_extra_tokens,
+    alibi_slope,
+    score_ptrs,
+    scores_scaled_shifted_ptrs,
+    IS_CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL_QK: tl.constexpr,
+    BLOCK_DMODEL_V: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    OFFS_M: tl.constexpr,
+    OFFS_N: tl.constexpr,
+    PRE_LOAD_V: tl.constexpr,
+    MASK_STEPS: tl.constexpr,
+    ENABLE_DROPOUT: tl.constexpr,
+    PADDED_HEAD_QK: tl.constexpr,
+    PADDED_HEAD_V: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
+    SM_SCALE: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+    RETURN_SCORES: tl.constexpr,
+):
     if USE_EXP2:
         RCP_LN2: tl.constexpr = 1.4426950408889634
 
@@ -266,13 +295,15 @@ def _attn_fwd_inner(
             k_offs_n = start_n + tl.arange(0, BLOCK_N)
         else:
             k_offs_n = None
-        k_offs_k = None if not PADDED_HEAD else tl.arange(0, BLOCK_DMODEL)
-        k = load_fn(k_ptrs, k_offs_k, k_offs_n, ACTUAL_BLOCK_DMODEL,
+        k_offs_k = None if not PADDED_HEAD_QK else tl.arange(
+            0, BLOCK_DMODEL_QK)
+        k = load_fn(k_ptrs, k_offs_k, k_offs_n, ACTUAL_BLOCK_DMODEL_QK,
                     actual_seqlen_k)
+        v_offs_k = None if not PADDED_HEAD_V else tl.arange(0, BLOCK_DMODEL_V)
         if PRE_LOAD_V:
             # We can use the same offsets as k, just with dims transposed.
-            v = load_fn(v_ptrs, k_offs_n, k_offs_k, actual_seqlen_k,
-                        ACTUAL_BLOCK_DMODEL)
+            v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k,
+                        ACTUAL_BLOCK_DMODEL_V)
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
@@ -376,8 +407,8 @@ def _attn_fwd_inner(
             alpha = tl.math.exp(m_diff)
         acc = acc * alpha[:, None]
         if not PRE_LOAD_V:
-            v = load_fn(v_ptrs, k_offs_n, k_offs_k, actual_seqlen_k,
-                        ACTUAL_BLOCK_DMODEL)
+            v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k,
+                        ACTUAL_BLOCK_DMODEL_V)
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         # update m_i and l_i
@@ -413,7 +444,8 @@ def get_autotune_fwd_configs():
         ),
     ], [
         "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K",
-        "ACTUAL_BLOCK_DMODEL", "VARLEN", "HQ", "HK", "USE_FP8"
+        "ACTUAL_BLOCK_DMODEL_QK", "ACTUAL_BLOCK_DMODEL_V", "VARLEN", "HQ",
+        "HK", "USE_FP8"
     ]
 
 
@@ -473,6 +505,7 @@ def attn_fwd(
     stride_kdescale_z: tl.constexpr,
     stride_kdescale_h: tl.constexpr,
     stride_kdescale_m: tl.constexpr,
+    padded_kscale_block_num: tl.constexpr,
     cu_seqlens_q,
     cu_seqlens_k,
     dropout_p,
@@ -484,13 +517,15 @@ def attn_fwd(
     alibi_slopes,
     HQ: tl.constexpr,
     HK: tl.constexpr,
-    ACTUAL_BLOCK_DMODEL: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
     MAX_SEQLENS_Q: tl.constexpr,
     MAX_SEQLENS_K: tl.constexpr,
     VARLEN: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DMODEL_QK: tl.constexpr,
+    BLOCK_DMODEL_V: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
     USE_BIAS: tl.constexpr,
@@ -504,7 +539,8 @@ def attn_fwd(
     off_z = tl.program_id(2)
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK)
+    offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
 
     # If MQA / GQA, set the K and V head offsets appropriately.
     GROUP_SIZE: tl.constexpr = HQ // HK
@@ -515,11 +551,14 @@ def attn_fwd(
 
     # we assume q and k has the same length
     if USE_FP8:
+        actual_kscale_block_num = stride_kdescale_h
+        kscale_mask = tl.arange(
+            0, padded_kscale_block_num) < actual_kscale_block_num
         k_descale_offset = k_descale_ptr + stride_kdescale_z * off_z + stride_kdescale_h * off_h_k + tl.arange(
-            0, stride_kdescale_h)
+            0, padded_kscale_block_num)
         q_descale_offset = q_descale_ptr + stride_qdescale_z * off_z + stride_qdescale_h * off_h_q + start_m  #  + stride_qdescale_m * cu_seqlens_q
 
-        k_descale = tl.load(k_descale_offset)
+        k_descale = tl.load(k_descale_offset, mask=kscale_mask, other=1.0)
         q_descale = tl.load(q_descale_offset)
         v_scale = tl.load(v_scale_ptr)
     else:
@@ -570,9 +609,10 @@ def attn_fwd(
         # the blocks that are all 0. We exit early.
         if n_blocks <= 0:
             o_offset = Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
-            o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d[
+            o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d_v[
                 None, :] * stride_on
-            acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=Out.type.element_ty)
+            acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_V],
+                           dtype=Out.type.element_ty)
             o_ptrs_mask = offs_m[:, None] < seqlen_q
             # We still need to write 0s to the result
             tl.store(o_ptrs, acc, mask=o_ptrs_mask)
@@ -600,18 +640,19 @@ def attn_fwd(
         n_extra_tokens = BLOCK_N - seqlen_k
     elif seqlen_k % BLOCK_N:
         n_extra_tokens = seqlen_k % BLOCK_N
-    PADDED_HEAD: tl.constexpr = (ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL)
+    PADDED_HEAD_QK: tl.constexpr = (ACTUAL_BLOCK_DMODEL_QK != BLOCK_DMODEL_QK)
+    PADDED_HEAD_V: tl.constexpr = (ACTUAL_BLOCK_DMODEL_V != BLOCK_DMODEL_V)
 
     # Compute pointers for all the tensors used in this kernel.
     q_offset = Q + off_z * stride_qz + off_h_q * stride_qh + cu_seqlens_q_start * stride_qm
-    q_ptrs = q_offset + offs_m[:,
-                               None] * stride_qm + offs_d[None, :] * stride_qk
+    q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_qk[
+        None, :] * stride_qk
     k_offset = K + off_z * stride_kz + off_h_k * stride_kh + cu_seqlens_k_start * stride_kn
-    k_ptrs = k_offset + offs_d[:,
-                               None] * stride_kk + offs_n[None, :] * stride_kn
+    k_ptrs = k_offset + offs_d_qk[:, None] * stride_kk + offs_n[
+        None, :] * stride_kn
     v_offset = V + off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
-    v_ptrs = v_offset + offs_n[:,
-                               None] * stride_vk + offs_d[None, :] * stride_vn
+    v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_d_v[
+        None, :] * stride_vn
     if USE_BIAS:
         # Note: this might get large enough to overflow on some configs
         bias_offset = off_h_q * stride_bh
@@ -652,11 +693,12 @@ def attn_fwd(
     # initialize pointer to m and l
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_V], dtype=tl.float32)
     # Q is loaded once at the beginning and shared by all N blocks.
     q_ptrs_mask = offs_m[:, None] < seqlen_q
-    if PADDED_HEAD:
-        q_ptrs_mask = q_ptrs_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
+    if PADDED_HEAD_QK:
+        q_ptrs_mask = q_ptrs_mask & (offs_d_qk[None, :]
+                                     < ACTUAL_BLOCK_DMODEL_QK)
 
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
 
@@ -716,7 +758,8 @@ def attn_fwd(
             # IS_CAUSAL, ....
             False,
             BLOCK_M,
-            BLOCK_DMODEL,
+            BLOCK_DMODEL_QK,
+            BLOCK_DMODEL_V,
             BLOCK_N,
             offs_m,
             offs_n,
@@ -724,8 +767,10 @@ def attn_fwd(
             PRE_LOAD_V,
             False,
             ENABLE_DROPOUT,
-            PADDED_HEAD,
-            ACTUAL_BLOCK_DMODEL,
+            PADDED_HEAD_QK,
+            PADDED_HEAD_V,
+            ACTUAL_BLOCK_DMODEL_QK,
+            ACTUAL_BLOCK_DMODEL_V,
             SM_SCALE,
             USE_EXP2=USE_EXP2,
             RETURN_SCORES=RETURN_SCORES)
@@ -779,7 +824,8 @@ def attn_fwd(
             scores_scaled_shifted_ptrs,
             IS_CAUSAL,
             BLOCK_M,
-            BLOCK_DMODEL,
+            BLOCK_DMODEL_QK,
+            BLOCK_DMODEL_V,
             BLOCK_N,
             offs_m,
             offs_n,
@@ -787,8 +833,10 @@ def attn_fwd(
             PRE_LOAD_V,
             True,
             ENABLE_DROPOUT,
-            PADDED_HEAD,
-            ACTUAL_BLOCK_DMODEL,
+            PADDED_HEAD_QK,
+            PADDED_HEAD_V,
+            ACTUAL_BLOCK_DMODEL_QK,
+            ACTUAL_BLOCK_DMODEL_V,
             SM_SCALE,
             USE_EXP2=USE_EXP2,
             RETURN_SCORES=RETURN_SCORES)
@@ -813,7 +861,7 @@ def attn_fwd(
     acc = acc.to(Out.type.element_ty)
     if IS_CAUSAL:
         if causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
-            out_mask_boundary = tl.full((BLOCK_DMODEL, ),
+            out_mask_boundary = tl.full((BLOCK_DMODEL_V, ),
                                         causal_start_idx,
                                         dtype=tl.int32)
             mask_m_offsets = start_m_idx + tl.arange(0, BLOCK_M)
@@ -859,14 +907,23 @@ def attn_fwd(
 
     # write back O
     o_offset = Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
-    o_ptrs = o_offset + offs_m[:,
-                               None] * stride_om + offs_d[None, :] * stride_on
-    o_ptrs_mask = tl.full([BLOCK_M, BLOCK_DMODEL], 1, dtype=tl.int1)
+    o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d_v[
+        None, :] * stride_on
+    o_ptrs_mask = tl.full([BLOCK_M, BLOCK_DMODEL_V], 1, dtype=tl.int1)
     if overflow_size > 0:
         o_ptrs_mask = o_ptrs_mask & (offs_m[:, None] < seqlen_q)
-    if PADDED_HEAD:
-        o_ptrs_mask = o_ptrs_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
+    if PADDED_HEAD_V:
+        o_ptrs_mask = o_ptrs_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
     tl.store(o_ptrs, acc.to(Out.type.element_ty), mask=o_ptrs_mask)
+
+
+def get_padded_head_dim(head_size: int):
+    # Get closest power of 2 over or equal to 32.
+    padded_d_model = 1 << (head_size - 1).bit_length()
+    # Smallest head_dim supported is 16. If smaller, the tile in the
+    # kernel is padded - there is no padding in memory for any dims.
+    padded_d_model = max(padded_d_model, 16)
+    return padded_d_model
 
 
 @triton_op("amd::attention_block_forward_triton_impl", mutates_args=())
@@ -912,8 +969,11 @@ def attention_block_forward_triton_impl(
         print("use_exp2:", use_exp2)
         print("use_fp8:", use_fp8)
 
-    o = torch.empty_like(
-        q,
+    o_shape = list(q.shape)
+    o_shape[-1] = v.shape[-1]  # output shape should match v's head dim
+    o = torch.empty(
+        o_shape,
+        device=q.device,
         dtype=fwd_torch_dtype if use_fp8 else q.dtype,
         requires_grad=True,
     )
@@ -925,16 +985,17 @@ def attention_block_forward_triton_impl(
     if (bias is not None):
         assert (bias.numel() < 2**31)
 
-    batch, nheads_q, nheads_k, head_size, seqlen_q, seqlen_k = get_shape_from_layout(
-        q, k, layout, cu_seqlens_q, cu_seqlens_k, max_seqlens_q, max_seqlens_k)
-    q_strides, k_strides, v_strides, o_strides = get_strides_from_layout(
-        q, k, v, o, layout)
+    batch, nheads_q, nheads_k, head_size_qk, head_size_v, seqlen_q, seqlen_k = get_shape_from_layout(
+        q, k, v, layout, cu_seqlens_q, cu_seqlens_k, max_seqlens_q,
+        max_seqlens_k)
+    q_strides = get_strides_from_layout(q, layout)
+    k_strides = get_strides_from_layout(k, layout)
+    v_strides = get_strides_from_layout(v, layout)
+    o_strides = get_strides_from_layout(o, layout)
 
     # Get closest power of 2 over or equal to 32.
-    padded_d_model = 1 << (head_size - 1).bit_length()
-    # Smallest head_dim supported is 16. If smaller, the tile in the
-    # kernel is padded - there is no padding in memory for any dims.
-    padded_d_model = max(padded_d_model, 16)
+    padded_d_model_qk = get_padded_head_dim(head_size_qk)
+    padded_d_model_v = get_padded_head_dim(head_size_v)
 
     grid = (triton.cdiv(max_seqlens_q, FIXED_BLOCK_M), nheads_q, batch)
 
@@ -994,10 +1055,12 @@ def attention_block_forward_triton_impl(
             0), q_descale.stride(1), q_descale.stride(2)
         stride_kdescale_z, stride_kdescale_h, stride_kdescale_m = k_descale.stride(
             0), k_descale.stride(1), k_descale.stride(2)
+        padded_kscale_block_num = 1 << (stride_kdescale_h - 1).bit_length()
 
     else:
         stride_qdescale_z, stride_qdescale_h, stride_qdescale_m = None, None, None
         stride_kdescale_z, stride_kdescale_h, stride_kdescale_m = None, None, None
+        padded_kscale_block_num = None
 
     wrap_triton(attn_fwd)[grid](
         q,
@@ -1028,6 +1091,7 @@ def attention_block_forward_triton_impl(
         stride_kdescale_z,
         stride_kdescale_h,
         stride_kdescale_m,
+        padded_kscale_block_num,
         cu_seqlens_q,
         cu_seqlens_k,
         dropout_p=dropout_p,
@@ -1039,12 +1103,14 @@ def attention_block_forward_triton_impl(
         alibi_slopes=alibi_slopes,
         HQ=nheads_q,
         HK=nheads_k,
-        ACTUAL_BLOCK_DMODEL=head_size,
+        ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
+        ACTUAL_BLOCK_DMODEL_V=head_size_v,
         MAX_SEQLENS_Q=max_seqlens_q,
         MAX_SEQLENS_K=max_seqlens_k,
         IS_CAUSAL=causal,
         VARLEN=is_varlen,
-        BLOCK_DMODEL=padded_d_model,
+        BLOCK_DMODEL_QK=padded_d_model_qk,
+        BLOCK_DMODEL_V=padded_d_model_v,
         USE_BIAS=False if bias is None else True,
         USE_ALIBI=False if alibi_slopes is None else True,
         ENABLE_DROPOUT=dropout_p > 0.0,
@@ -1082,8 +1148,8 @@ def _bwd_preprocess_use_o(
     max_seqlen_q,
     max_seqlen_k,
     BLOCK_M: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-    ACTUAL_BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DMODEL_V: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
     N_CTX_Q: tl.constexpr,
     Z: tl.constexpr,
     HQ: tl.constexpr,
@@ -1118,20 +1184,20 @@ def _bwd_preprocess_use_o(
         N_CTX_K = max_seqlen_k
 
     off_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    off_d = tl.arange(0, BLOCK_DMODEL)
+    off_d_v = tl.arange(0, BLOCK_DMODEL_V)
 
     mask_m = off_m < N_CTX_Q
-    mask_d = off_d < ACTUAL_BLOCK_DMODEL
-    mask_o = mask_m[:, None] & mask_d[None, :]
+    mask_d_v = off_d_v < ACTUAL_BLOCK_DMODEL_V
+    mask_o = mask_m[:, None] & mask_d_v[None, :]
 
     # compute offsets
     o_offset = Out + off_z * stride_oz + off_h * stride_oh + q_start * stride_om
-    do_offset = DO + off_z * stride_oz + off_h * stride_oh + q_start * stride_om
+    do_offset = DO + off_z * stride_doz + off_h * stride_doh + q_start * stride_dom
 
     # compute pointers
-    out_ptrs = o_offset + off_m[:,
-                                None] * stride_om + off_d[None, :] * stride_ok
-    do_ptrs = do_offset + off_m[:, None] * stride_dom + off_d[
+    out_ptrs = o_offset + off_m[:, None] * stride_om + off_d_v[
+        None, :] * stride_ok
+    do_ptrs = do_offset + off_m[:, None] * stride_dom + off_d_v[
         None, :] * stride_dok
 
     # load
@@ -1153,7 +1219,7 @@ def _bwd_preprocess_use_o(
         do_fp8 = (do * do_scale).to(F8_BWD_DTYPE)
 
         do_fp8_offset = DO_FP8 + off_z * stride_oz + off_h * stride_oh + q_start * stride_om
-        do_fp8_ptrs = do_fp8_offset + off_m[:, None] * stride_dom + off_d[
+        do_fp8_ptrs = do_fp8_offset + off_m[:, None] * stride_dom + off_d_v[
             None, :] * stride_dok
 
         tl.store(do_fp8_ptrs, do_fp8, mask=mask_o)
@@ -1170,8 +1236,8 @@ def get_autotune_bwd_configs():
             num_warps=4,
         ),
     ], [
-        "BLOCK_DMODEL", "ACTUAL_BLOCK_DMODEL", "SEQUENCE_PARALLEL",
-        "CAUSAL", "USE_FP8"
+        "BLOCK_DMODEL", "ACTUAL_BLOCK_DMODEL_QK", "ACTUAL_BLOCK_DMODEL_V",
+        "SEQUENCE_PARALLEL", "CAUSAL", "USE_FP8"
     ]
 
 
@@ -1212,6 +1278,10 @@ def _bwd_kernel_dkdv(
     stride_vh,
     stride_vn,
     stride_vk,
+    stride_doz,
+    stride_doh,
+    stride_dom,
+    stride_dok,
     stride_ldz,
     stride_ldh,
     stride_ldm,
@@ -1224,6 +1294,9 @@ def _bwd_kernel_dkdv(
     stride_kscalez: tl.constexpr,
     stride_kscaleh: tl.constexpr,
     stride_kscalem: tl.constexpr,
+    padded_doscale_block_num: tl.constexpr,
+    padded_qscale_block_num: tl.constexpr,
+    padded_kscale_block_num: tl.constexpr,
     Z,
     HQ: tl.constexpr,
     HK: tl.constexpr,
@@ -1234,8 +1307,10 @@ def _bwd_kernel_dkdv(
     num_block_m: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-    ACTUAL_BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DMODEL_QK: tl.constexpr,
+    BLOCK_DMODEL_V: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
     SEQUENCE_PARALLEL: tl.constexpr,
     CAUSAL: tl.constexpr,
     USE_EXP2: tl.constexpr,
@@ -1277,7 +1352,7 @@ def _bwd_kernel_dkdv(
     q_offset = Q + off_z * stride_qz + off_h_q * stride_qh + q_start * stride_qm
     k_offset = K + off_z * stride_kz + off_h_k * stride_kh + k_start * stride_kn
     v_offset = V + off_z * stride_vz + off_h_k * stride_vh + k_start * stride_vn
-    do_offset = DO + off_z * stride_qz + off_h_q * stride_qh + q_start * stride_qm
+    do_offset = DO + off_z * stride_doz + off_h_q * stride_doh + q_start * stride_dom
     ld_offset = LD + off_z * stride_ldz + off_h_q * stride_ldh + q_start * stride_ldm
 
     # output tensor offsets
@@ -1290,17 +1365,27 @@ def _bwd_kernel_dkdv(
         # while q, k, do in per-block scaling
         v_scale = tl.load(v_scale_ptr)  # + tl.arange(0, num_block_n)
 
+        actual_doscale_block_num = stride_doscaleh * GROUP_SIZE
+        actual_qscale_block_num = stride_qscaleh * GROUP_SIZE
+        actual_kscale_block_num = stride_kscaleh
+
+        doscale_mask = tl.arange(
+            0, padded_doscale_block_num) < actual_doscale_block_num
         do_descale_offset = do_descale_ptr + off_z * stride_doscalez + off_h_q * stride_doscaleh + tl.arange(
-            0, stride_doscaleh * GROUP_SIZE)  #  + q_start * stride_qm
-        do_descale = tl.load(do_descale_offset)
+            0, padded_doscale_block_num)  #  + q_start * stride_qm
+        do_descale = tl.load(do_descale_offset, mask=doscale_mask, other=1.0)
 
+        qscale_mask = tl.arange(
+            0, padded_qscale_block_num) < actual_qscale_block_num
         q_descale_offset = q_scale_ptr + off_z * stride_qscalez + off_h_q * stride_qscaleh + tl.arange(
-            0, stride_qscaleh * GROUP_SIZE)  #  + q_start * stride_qm
-        q_descale = tl.load(q_descale_offset)
+            0, padded_qscale_block_num)  #  + q_start * stride_qm
+        q_descale = tl.load(q_descale_offset, mask=qscale_mask, other=1.0)
 
+        kscale_mask = tl.arange(
+            0, padded_kscale_block_num) < actual_kscale_block_num
         k_descale_offset = k_descale_ptr + off_z * stride_kscalez + off_h_k * stride_kscaleh + tl.arange(
-            0, stride_kscaleh)  #  + q_start * stride_qm
-        k_descale = tl.load(k_descale_offset)
+            0, padded_kscale_block_num)  #  + q_start * stride_qm
+        k_descale = tl.load(k_descale_offset, mask=kscale_mask, other=1.0)
 
     else:
         q_descale = 1.
@@ -1316,28 +1401,31 @@ def _bwd_kernel_dkdv(
         causal_boundary = 0
         lo = 0
 
-    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK)
+    offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
     offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
     idx_tensor = tl.full([1], start_n, dtype=tl.int32)
 
     mask_n = offs_n < N_CTX_K
-    mask_d = offs_d < ACTUAL_BLOCK_DMODEL
-    kv_mask = mask_n[:, None] & mask_d[None, :]
+    mask_d_qk = offs_d_qk < ACTUAL_BLOCK_DMODEL_QK
+    mask_d_v = offs_d_v < ACTUAL_BLOCK_DMODEL_V
+    k_mask = mask_n[:, None] & mask_d_qk[None, :]
+    v_mask = mask_n[:, None] & mask_d_v[None, :]
 
-    k_ptrs = k_offset + offs_n[:,
-                               None] * stride_kn + offs_d[None, :] * stride_kk
-    v_ptrs = v_offset + offs_n[:,
-                               None] * stride_vn + offs_d[None, :] * stride_vk
+    k_ptrs = k_offset + offs_n[:, None] * stride_kn + offs_d_qk[
+        None, :] * stride_kk
+    v_ptrs = v_offset + offs_n[:, None] * stride_vn + offs_d_v[
+        None, :] * stride_vk
 
-    k = tl.load(k_ptrs, mask=kv_mask, other=0.0)
-    v = tl.load(v_ptrs, mask=kv_mask, other=0.0)
+    k = tl.load(k_ptrs, mask=k_mask, other=0.0)
+    v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
     k = tl.trans(k)
     v = tl.trans(v)
 
-    dk = tl.zeros([BLOCK_DMODEL, BLOCK_N], dtype=tl.float32)
-    dv = tl.zeros([BLOCK_DMODEL, BLOCK_N], dtype=tl.float32)
+    dk = tl.zeros([BLOCK_DMODEL_QK, BLOCK_N], dtype=tl.float32)
+    dv = tl.zeros([BLOCK_DMODEL_V, BLOCK_N], dtype=tl.float32)
 
     if USE_FP8:
         blk_k_descale = k_descale.gather(index=idx_tensor, axis=0)
@@ -1347,81 +1435,88 @@ def _bwd_kernel_dkdv(
 
     for group_idx in range(GROUP_SIZE):
         dk, dv = _attn_bwd_dkdv(
-            k, v, dk, dv, offs_d, offs_n, q_offset, do_offset, mask_d,
-            stride_qm, stride_qk, ld_offset, stride_ldm, BLOCK_M, BLOCK_N,
-            BLOCK_DMODEL, q_descale, do_descale, blk_k_descale, v_scale,
-            p_scale, sm_scale, log_p_scale, lo, num_block_m, causal_boundary,
-            USE_FP8, USE_EXP2, F8_FWD_MAX, N_CTX_Q, N_CTX_K, CAUSAL, group_idx)
+            k, v, dk, dv, offs_d_qk, offs_d_v, offs_n, mask_d_qk, mask_d_v,
+            q_offset, do_offset, stride_qm, stride_qk, stride_dom, stride_dok,
+            ld_offset, stride_ldm, BLOCK_M, BLOCK_N, q_descale, do_descale,
+            blk_k_descale, v_scale, p_scale, sm_scale, log_p_scale, lo,
+            num_block_m, causal_boundary, USE_FP8, USE_EXP2, F8_FWD_MAX,
+            N_CTX_Q, N_CTX_K, CAUSAL, group_idx)
 
         q_offset += stride_qh
         do_offset += stride_qh
         ld_offset += stride_ldh
 
+    if USE_FP8:
+        dv_descale = 1. / (p_scale)
+        dv *= dv_descale
+
     dk = tl.trans(dk)
     dv = tl.trans(dv)
 
-    dk_ptrs = dk_offset + offs_n[:, None] * stride_kn + offs_d[
+    dk_ptrs = dk_offset + offs_n[:, None] * stride_kn + offs_d_qk[
         None, :] * stride_kk
-    tl.store(dk_ptrs, dk, mask=kv_mask)
+    tl.store(dk_ptrs, dk, mask=k_mask)
 
-    dv_ptrs = dv_offset + offs_n[:, None] * stride_vn + offs_d[
+    dv_ptrs = dv_offset + offs_n[:, None] * stride_vn + offs_d_v[
         None, :] * stride_vk
-    tl.store(dv_ptrs, dv, mask=kv_mask)
+    tl.store(dv_ptrs, dv, mask=v_mask)
 
 
 @triton.jit
-def _attn_bwd_dkdv(k,
-                   v,
-                   dk,
-                   dv,
-                   offs_d,
-                   offs_n,
-                   q_offset,
-                   do_offset,
-                   mask_d,
-                   stride_qm,
-                   stride_qk,
-                   ld_offset,
-                   stride_ldm,
-                   BLOCK_M: tl.constexpr,
-                   BLOCK_N: tl.constexpr,
-                   BLOCK_DMODEL: tl.constexpr,
-                   q_descale,
-                   do_descale,
-                   k_descale,
-                   v_scale,
-                   p_scale: tl.constexpr,
-                   sm_scale: tl.constexpr,
-                   log_p_scale: tl.constexpr,
-                   lo: tl.constexpr,
-                   num_block_m: tl.constexpr,
-                   causal_boundary: tl.constexpr,
-                   USE_FP8: tl.constexpr,
-                   USE_EXP2: tl.constexpr,
-                   F8_FWD_MAX: tl.constexpr,
-                   N_CTX_Q: tl.constexpr,
-                   N_CTX_K: tl.constexpr,
-                   CAUSAL: tl.constexpr,
-                   GROUP_IDX: tl.constexpr,
-    ):
+def _attn_bwd_dkdv(
+    k,
+    v,
+    dk,
+    dv,
+    offs_d_qk,
+    offs_d_v,
+    offs_n,
+    mask_d_qk,
+    mask_d_v,
+    q_offset,
+    do_offset,
+    stride_qm,
+    stride_qk,
+    stride_dom,
+    stride_dok,
+    ld_offset,
+    stride_ldm,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    q_descale,
+    do_descale,
+    k_descale,
+    v_scale,
+    p_scale: tl.constexpr,
+    sm_scale: tl.constexpr,
+    log_p_scale: tl.constexpr,
+    lo: tl.constexpr,
+    num_block_m: tl.constexpr,
+    causal_boundary: tl.constexpr,
+    USE_FP8: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+    F8_FWD_MAX: tl.constexpr,
+    N_CTX_Q: tl.constexpr,
+    N_CTX_K: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    GROUP_IDX: tl.constexpr = 0,
+):
     idx_block_m = tl.full([1],
                           lo // BLOCK_M - 1 + GROUP_IDX * num_block_m,
                           dtype=tl.int32)
-
-    if USE_FP8:
-        dv_descale = 1. / (p_scale)
 
     # loop over rows
     for start_m in range(lo, num_block_m * BLOCK_M, BLOCK_M):
         # can_skip_causal_block = start_m < causal_boundary
         offs_m = start_m + tl.arange(0, BLOCK_M)
-        q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d[
+        q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_qk[
             None, :] * stride_qk
-        do_ptrs = do_offset + offs_m[:, None] * stride_qm + offs_d[
-            None, :] * stride_qk
+        do_ptrs = do_offset + offs_m[:, None] * stride_dom + offs_d_v[
+            None, :] * stride_dok
 
         mask_m = offs_m < N_CTX_Q
-        q_mask = mask_m[:, None] & mask_d[None, :]
+        q_mask = mask_m[:, None] & mask_d_qk[None, :]
+        do_mask = mask_m[:, None] & mask_d_v[None, :]
 
         if USE_FP8:
             idx_block_m += 1
@@ -1440,13 +1535,13 @@ def _attn_bwd_dkdv(k,
             qk = qk * qk_descale  # we fused sm_scale into blk_q_descale so we do not need one more mul here
 
         if CAUSAL:
-            #if not can_skip_causal_block:
+            # if not can_skip_causal_block:
             col_offset = N_CTX_Q - N_CTX_K
             causal_mask = offs_m[:, None] >= (col_offset + offs_n[None, :])
             qk = tl.where(causal_mask, qk, float("-inf"))
 
-        offs_ldm = 2 * start_m + tl.arange(0, 2 * BLOCK_M)
-        l_ptrs = ld_offset + offs_ldm * stride_ldm
+        l_ptrs = ld_offset + (2 * start_m +
+                              tl.arange(0, 2 * BLOCK_M)) * stride_ldm
         mask_ldm = tl.ravel(tl.join(mask_m, mask_m))
         lds = tl.load(l_ptrs, mask=mask_ldm, other=0.0)
         l_i = tl.gather(lds, index=tl.arange(0, BLOCK_M), axis=0)
@@ -1461,7 +1556,7 @@ def _attn_bwd_dkdv(k,
             qk *= sm_scale
             p = tl.math.exp(qk - l_i[:, None] + log_p_scale)
 
-        do = tl.load(do_ptrs, mask=q_mask, other=0.0)
+        do = tl.load(do_ptrs, mask=do_mask, other=0.0)
 
         # compute dp
         dp = tl.dot(do, v, out_dtype=tl.float32)
@@ -1486,7 +1581,7 @@ def _attn_bwd_dkdv(k,
                      allow_tf32=False)
 
         if USE_FP8:
-            dv = tl.fma(_dv, blk_do_descale * dv_descale, dv)
+            dv = tl.fma(_dv, blk_do_descale, dv)
         else:
             dv += _dv
 
@@ -1536,6 +1631,10 @@ def _bwd_kernel_dq(
     stride_vh,
     stride_vn,
     stride_vk,
+    stride_doz,
+    stride_doh,
+    stride_dom,
+    stride_dok,
     stride_ldz,
     stride_ldh,
     stride_ldm,
@@ -1548,6 +1647,9 @@ def _bwd_kernel_dq(
     stride_kscalez: tl.constexpr,
     stride_kscaleh: tl.constexpr,
     stride_kscalem: tl.constexpr,
+    padded_doscale_block_num: tl.constexpr,
+    padded_qscale_block_num: tl.constexpr,
+    padded_kscale_block_num: tl.constexpr,
     Z,
     HQ: tl.constexpr,
     HK: tl.constexpr,
@@ -1558,8 +1660,10 @@ def _bwd_kernel_dq(
     num_block_m: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-    ACTUAL_BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DMODEL_QK: tl.constexpr,
+    BLOCK_DMODEL_V: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
     SEQUENCE_PARALLEL: tl.constexpr,
     CAUSAL: tl.constexpr,
     USE_EXP2: tl.constexpr,
@@ -1603,7 +1707,7 @@ def _bwd_kernel_dq(
     q_offset = Q + off_z * stride_qz + off_h_q * stride_qh + q_start * stride_qm
     k_offset = K + off_z * stride_kz + off_h_k * stride_kh + k_start * stride_kn
     v_offset = V + off_z * stride_vz + off_h_k * stride_vh + k_start * stride_vn
-    do_offset = DO + off_z * stride_qz + off_h_q * stride_qh + q_start * stride_qm
+    do_offset = DO + off_z * stride_doz + off_h_q * stride_doh + q_start * stride_dom
     ld_offset = LD + off_z * stride_ldz + off_h_q * stride_ldh + q_start * stride_ldm
 
     # output tensor offsets
@@ -1614,18 +1718,28 @@ def _bwd_kernel_dq(
         # while q, k, do in per-block scaling
         v_scale = tl.load(v_scale_ptr)  # + tl.arange(0, num_block_n)
 
+        actual_doscale_block_num = stride_doscaleh
+        actual_qscale_block_num = stride_qscaleh
+        acutal_kscale_block_num = stride_kscaleh
+
         # test here
+        doscale_mask = tl.arange(
+            0, padded_doscale_block_num) < actual_doscale_block_num
         do_descale_offset = do_descale_ptr + off_z * stride_doscalez + off_h_q * stride_doscaleh + tl.arange(
-            0, stride_doscaleh)  #  + q_start * stride_qm
-        do_descale = tl.load(do_descale_offset)
+            0, padded_doscale_block_num)  #  + q_start * stride_qm
+        do_descale = tl.load(do_descale_offset, mask=doscale_mask, other=1.0)
 
+        qscale_mask = tl.arange(
+            0, padded_qscale_block_num) < actual_qscale_block_num
         q_descale_offset = q_scale_ptr + off_z * stride_qscalez + off_h_q * stride_qscaleh + tl.arange(
-            0, stride_qscaleh)  #  + q_start * stride_qm
-        q_descale = tl.load(q_descale_offset)
+            0, padded_qscale_block_num)  #  + q_start * stride_qm
+        q_descale = tl.load(q_descale_offset, mask=qscale_mask, other=1.0)
 
+        kscale_mask = tl.arange(
+            0, padded_kscale_block_num) < acutal_kscale_block_num
         k_descale_offset = k_descale_ptr + off_z * stride_kscalez + off_h_k * stride_kscaleh + tl.arange(
-            0, stride_kscaleh)  #  + q_start * stride_qm
-        k_descale = tl.load(k_descale_offset)
+            0, padded_kscale_block_num)  #  + q_start * stride_qm
+        k_descale = tl.load(k_descale_offset, mask=kscale_mask, other=1.0)
     else:
         q_descale = 1.
         k_descale = 1.
@@ -1641,23 +1755,26 @@ def _bwd_kernel_dq(
         causal_boundary = 0
         hi = num_block_n * BLOCK_N
 
-    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK)
+    offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
     idx_tensor = tl.full([1], start_m, dtype=tl.int32)
 
     # compute dq
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    dq = tl.zeros([BLOCK_DMODEL, BLOCK_M], dtype=tl.float32)
-    q_ptrs = q_offset + offs_m[:,
-                               None] * stride_qm + offs_d[None, :] * stride_qk
-    do_ptrs = do_offset + offs_m[:, None] * stride_qm + offs_d[
+    dq = tl.zeros([BLOCK_DMODEL_QK, BLOCK_M], dtype=tl.float32)
+    q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_qk[
         None, :] * stride_qk
+    do_ptrs = do_offset + offs_m[:, None] * stride_dom + offs_d_v[
+        None, :] * stride_dok
 
     mask_m = offs_m < N_CTX_Q
-    mask_d = offs_d < ACTUAL_BLOCK_DMODEL
-    mask_q = mask_m[:, None] & mask_d[None, :]
+    mask_d_qk = offs_d_qk < ACTUAL_BLOCK_DMODEL_QK
+    mask_d_v = offs_d_v < ACTUAL_BLOCK_DMODEL_V
+    mask_q = mask_m[:, None] & mask_d_qk[None, :]
+    mask_do = mask_m[:, None] & mask_d_v[None, :]
 
     q = tl.load(q_ptrs, mask=mask_q, other=0.0)
-    do = tl.load(do_ptrs, mask=mask_q, other=0.0)
+    do = tl.load(do_ptrs, mask=mask_do, other=0.0)
 
     if USE_FP8:
         blk_q_descale = q_descale.gather(index=idx_tensor, axis=0)
@@ -1666,34 +1783,59 @@ def _bwd_kernel_dq(
         blk_q_descale = 1.
         blk_do_descale = 1.
 
-    offs_ldm = 2 * start_m * BLOCK_M + tl.arange(0, 2 * BLOCK_M)
-    l_ptrs = ld_offset + offs_ldm * stride_ldm
+    l_ptrs = ld_offset + (2 * start_m * BLOCK_M +
+                          tl.arange(0, 2 * BLOCK_M)) * stride_ldm
     mask_ldm = tl.ravel(tl.join(mask_m, mask_m))
     lds = tl.load(l_ptrs, mask=mask_ldm, other=0.0)
 
-    dq = _attn_bwd_dq(dq, q, offs_d, offs_m, lds, do, mask_d, k_offset, v_offset,
-                      stride_kn, stride_kk, stride_vn, stride_vk, BLOCK_M,
-                      BLOCK_N, BLOCK_DMODEL, blk_q_descale, k_descale,
-                      blk_do_descale, v_scale, p_scale, sm_scale, log_p_scale,
-                      hi, num_block_m, causal_boundary, USE_FP8, USE_EXP2,
-                      F8_FWD_MAX, N_CTX_Q, N_CTX_K, CAUSAL)
+    dq = _attn_bwd_dq(dq, q, offs_d_qk, offs_d_v, offs_m, lds, do, mask_d_qk,
+                      mask_d_v, k_offset, v_offset, stride_kn, stride_kk,
+                      stride_vn, stride_vk, BLOCK_M, BLOCK_N, blk_q_descale,
+                      k_descale, blk_do_descale, v_scale, p_scale, sm_scale,
+                      log_p_scale, hi, num_block_m, causal_boundary, USE_FP8,
+                      USE_EXP2, F8_FWD_MAX, N_CTX_Q, N_CTX_K, CAUSAL)
 
-    dq_ptrs = dq_offset + offs_m[:, None] * stride_qm + offs_d[
+    dq_ptrs = dq_offset + offs_m[:, None] * stride_qm + offs_d_qk[
         None, :] * stride_qk
     tl.store(dq_ptrs, tl.trans(dq), mask=mask_q)
 
 
 @triton.jit
-def _attn_bwd_dq(dq, q, offs_d, offs_m, lds, do, mask_d, k_offset, v_offset,
-                 stride_kn, stride_kk, stride_vn, stride_vk,
-                 BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-                 BLOCK_DMODEL: tl.constexpr, q_descale, k_descale, do_descale,
-                 v_scale, p_scale: tl.constexpr, sm_scale: tl.constexpr,
-                 log_p_scale: tl.constexpr, hi: tl.constexpr,
-                 num_block_n: tl.constexpr, causal_boundary: tl.constexpr,
-                 USE_FP8: tl.constexpr, USE_EXP2: tl.constexpr,
-                 F8_FWD_MAX: tl.constexpr, N_CTX_Q: tl.constexpr,
-                 N_CTX_K: tl.constexpr, CAUSAL: tl.constexpr):
+def _attn_bwd_dq(
+    dq,
+    q,
+    offs_d_qk,
+    offs_d_v,
+    offs_m,
+    lds,
+    do,
+    mask_d_qk,
+    mask_d_v,
+    k_offset,
+    v_offset,
+    stride_kn,
+    stride_kk,
+    stride_vn,
+    stride_vk,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    q_descale,
+    k_descale,
+    do_descale,
+    v_scale,
+    p_scale: tl.constexpr,
+    sm_scale: tl.constexpr,
+    log_p_scale: tl.constexpr,
+    hi: tl.constexpr,
+    num_block_n: tl.constexpr,
+    causal_boundary: tl.constexpr,
+    USE_FP8: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+    F8_FWD_MAX: tl.constexpr,
+    N_CTX_Q: tl.constexpr,
+    N_CTX_K: tl.constexpr,
+    CAUSAL: tl.constexpr,
+):
     idx_block_n = tl.full([1], -1, dtype=tl.int32)
     l_i = tl.gather(lds, index=tl.arange(0, BLOCK_M), axis=0)
     Di = tl.gather(lds, index=tl.arange(BLOCK_M, 2 * BLOCK_M), axis=0)
@@ -1706,19 +1848,20 @@ def _attn_bwd_dq(dq, q, offs_d, offs_m, lds, do, mask_d, k_offset, v_offset,
     for start_n in range(0, hi, BLOCK_N):
         # can_skip_causal_block = start_n < causal_boundary
         offs_n = start_n + tl.arange(0, BLOCK_N)
-        
+
         mask_n = offs_n < N_CTX_K
-        mask_kv = mask_n[:, None] & mask_d[None, :]
+        mask_k = mask_n[:, None] & mask_d_qk[None, :]
+        mask_v = mask_n[:, None] & mask_d_v[None, :]
 
         # k_ptrs += stride_kn * BLOCK_N
         # v_ptrs += stride_kn * BLOCK_N
-        k_ptrs = k_offset + offs_n[:, None] * stride_kn + offs_d[
+        k_ptrs = k_offset + offs_n[:, None] * stride_kn + offs_d_qk[
             None, :] * stride_kk
-        v_ptrs = v_offset + offs_n[:, None] * stride_vn + offs_d[
+        v_ptrs = v_offset + offs_n[:, None] * stride_vn + offs_d_v[
             None, :] * stride_vk
 
-        k = tl.load(k_ptrs, mask=mask_kv, other=0.0)
-        v = tl.load(v_ptrs, mask=mask_kv, other=0.0)
+        k = tl.load(k_ptrs, mask=mask_k, other=0.0)
+        v = tl.load(v_ptrs, mask=mask_v, other=0.0)
 
         k = tl.trans(k)
         qk = tl.dot(q, k, out_dtype=tl.float32)
@@ -1819,8 +1962,7 @@ def attention_block_backward_triton_impl(
         print("max_seqlen_k:", max_seqlen_k)
         print("use_exp2:", use_exp2)
         print("sequence_parallel:", sequence_parallel)
-        print("use_fp8:", use_fp8)
-        
+
     # make contigious
     q = q.contiguous()
     k = k.contiguous()
@@ -1828,24 +1970,27 @@ def attention_block_backward_triton_impl(
     softmax_lse_delta = softmax_lse_delta.contiguous()
 
     # get strides and shape
-    batch, nheads_q, nheads_k, head_size, max_seqlen_q, max_seqlen_k = get_shape_from_layout(
-        q, k, layout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
-    q_strides, k_strides, v_strides, o_strides = get_strides_from_layout(
-        q, k, v, o, layout)
+    batch, nheads_q, nheads_k, head_size_qk, head_size_v, max_seqlen_q, max_seqlen_k = get_shape_from_layout(
+        q, k, v, layout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
+        max_seqlen_k)
+    q_strides = get_strides_from_layout(q, layout)
+    k_strides = get_strides_from_layout(k, layout)
+    v_strides = get_strides_from_layout(v, layout)
+    o_strides = get_strides_from_layout(o, layout)
+    do_strides = get_strides_from_layout(do, layout)
     stride_qz, stride_qh, stride_qm, stride_qk = q_strides
     stride_kz, stride_kh, stride_kn, stride_kk = k_strides
     stride_vz, stride_vh, stride_vn, stride_vk = v_strides
     stride_oz, stride_oh, stride_om, stride_ok = o_strides
+    stride_doz, stride_doh, stride_dom, stride_dok = do_strides
     batch_headsize_q = batch * nheads_q
     batch_headsize_k = batch * nheads_k
     is_varlen = layout == "thd"
 
-    assert head_size >= 32
-    assert head_size % 2 == 0
-    padded_d_model = 1 << (head_size - 1).bit_length()
-    padded_d_model = max(padded_d_model, 16)
-    BLOCK_DMODEL = padded_d_model
-    ACTUAL_BLOCK_DMODEL = head_size
+    assert head_size_qk >= 32 and head_size_v >= 32
+    assert head_size_qk % 2 == 0 and head_size_v % 2 == 0
+    padded_d_model_qk = get_padded_head_dim(head_size_qk)
+    padded_d_model_v = get_padded_head_dim(head_size_v)
 
     do = do.contiguous()
     # NOTE: we might need to copy the output tensor if they are not continuous or have other issues
@@ -1898,18 +2043,26 @@ def attention_block_backward_triton_impl(
         )
 
     if use_fp8:
-        do_fp8 = torch.empty(do.shape, dtype=get_f8_bwd_dtype(), device=q.device)
+        do_fp8 = torch.empty(do.shape,
+                             dtype=get_f8_bwd_dtype(),
+                             device=q.device)
         _shape = (batch, nheads_q, triton.cdiv(max_seqlen_q, FIXED_BLOCK_M))
         do_scale = torch.empty(_shape, dtype=torch.float32, device=q.device)
         stride_descalez, stride_descaleh, stride_descalem = do_scale.stride()
         stride_qscalez, stride_qscaleh, stride_qscalem = q_scale.stride()
         stride_kscalez, stride_kscaleh, stride_kscalem = k_scale.stride()
+
+        padded_doscale_block_num = 1 << (stride_descaleh - 1).bit_length()
+        padded_qscale_block_num = 1 << (stride_qscaleh - 1).bit_length()
+        padded_kscale_block_num = 1 << (stride_kscaleh - 1).bit_length()
+
     else:
         do_fp8 = None
         do_scale = None
         stride_descalez, stride_descaleh, stride_descalem = None, None, None
         stride_qscalez, stride_qscaleh, stride_qscalem = None, None, None
         stride_kscalez, stride_kscaleh, stride_kscalem = None, None, None
+        padded_doscale_block_num, padded_qscale_block_num, padded_kscale_block_num = None, None, None
 
     grid_prebwd = (triton.cdiv(max_seqlen_q, FIXED_BLOCK_M), batch_headsize_q)
     wrap_triton(_bwd_preprocess_use_o)[grid_prebwd](
@@ -1923,10 +2076,10 @@ def attention_block_backward_triton_impl(
         stride_oh,
         stride_om,
         stride_ok,
-        stride_oz,
-        stride_oh,
-        stride_om,
-        stride_ok,
+        stride_doz,
+        stride_doh,
+        stride_dom,
+        stride_dok,
         stride_lse_delta_z,
         stride_lse_delta_h,
         stride_lse_delta_m,
@@ -1936,8 +2089,8 @@ def attention_block_backward_triton_impl(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
+        BLOCK_DMODEL_V=padded_d_model_v,
+        ACTUAL_BLOCK_DMODEL_V=head_size_v,
         BLOCK_M=FIXED_BLOCK_M,
         N_CTX_Q=max_seqlen_q,
         Z=batch,
@@ -1971,7 +2124,8 @@ def attention_block_backward_triton_impl(
         print("heads_q:", nheads_q)
         print("max_seqlen_q:", max_seqlen_q)
         print("max_seqlen_k:", max_seqlen_k)
-        print("BLOCK_DMODEL:", BLOCK_DMODEL)
+        print("BLOCK_DMODEL_QK:", padded_d_model_qk)
+        print("BLOCK_DMODEL_V:", padded_d_model_v)
         print("SEQUENCE_PARALLEL:", sequence_parallel)
         print("CAUSAL:", causal)
         print("USE_EXP2:", use_exp2)
@@ -2011,6 +2165,10 @@ def attention_block_backward_triton_impl(
         stride_vh,
         stride_vn,
         stride_vk,
+        stride_doz,
+        stride_doh,
+        stride_dom,
+        stride_dok,
         stride_lse_delta_z,
         stride_lse_delta_h,
         stride_lse_delta_m,
@@ -2023,6 +2181,9 @@ def attention_block_backward_triton_impl(
         stride_kscalez,
         stride_kscaleh,
         stride_kscalem,
+        padded_doscale_block_num,
+        padded_qscale_block_num,
+        padded_kscale_block_num,
         batch,
         nheads_q,
         nheads_k,
@@ -2033,8 +2194,10 @@ def attention_block_backward_triton_impl(
         num_block_m=num_block_m,
         BLOCK_M=FIXED_BLOCK_M,
         BLOCK_N=FIXED_BLOCK_N,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
+        BLOCK_DMODEL_QK=padded_d_model_qk,
+        BLOCK_DMODEL_V=padded_d_model_v,
+        ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
+        ACTUAL_BLOCK_DMODEL_V=head_size_v,
         SEQUENCE_PARALLEL=sequence_parallel,
         CAUSAL=causal,
         USE_EXP2=use_exp2,
@@ -2043,6 +2206,18 @@ def attention_block_backward_triton_impl(
         log_p_scale=log_p_scale,
         F8_FWD_MAX=F8_FWD_MAX,
     )
+
+    if use_fp8:
+        n_groups = nheads_q // nheads_k
+        padded_doscale_block_num = 1 << (stride_descaleh - 1).bit_length()
+        padded_qscale_block_num = 1 << (stride_qscaleh * n_groups -
+                                        1).bit_length()
+        padded_kscale_block_num = 1 << (stride_kscaleh * n_groups -
+                                        1).bit_length()
+    else:
+        padded_doscale_block_num = None
+        padded_qscale_block_num = None
+        padded_kscale_block_num = None
 
     grid_bwd_dkdv = (
         batch_headsize_k,
@@ -2077,6 +2252,10 @@ def attention_block_backward_triton_impl(
         stride_vh,
         stride_vn,
         stride_vk,
+        stride_doz,
+        stride_doh,
+        stride_dom,
+        stride_dok,
         stride_lse_delta_z,
         stride_lse_delta_h,
         stride_lse_delta_m,
@@ -2089,6 +2268,9 @@ def attention_block_backward_triton_impl(
         stride_kscalez,
         stride_kscaleh,
         stride_kscalem,
+        padded_doscale_block_num,
+        padded_qscale_block_num,
+        padded_kscale_block_num,
         batch,
         nheads_q,
         nheads_k,
@@ -2099,8 +2281,10 @@ def attention_block_backward_triton_impl(
         num_block_m=num_block_m,
         BLOCK_M=FIXED_BLOCK_M,
         BLOCK_N=FIXED_BLOCK_N,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
+        BLOCK_DMODEL_QK=padded_d_model_qk,
+        BLOCK_DMODEL_V=padded_d_model_v,
+        ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
+        ACTUAL_BLOCK_DMODEL_V=head_size_v,
         SEQUENCE_PARALLEL=sequence_parallel,
         CAUSAL=causal,
         USE_EXP2=use_exp2,

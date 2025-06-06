@@ -1197,13 +1197,15 @@ def fused_attn_fwd(
             mask = True
         else:
             mask = False
-        if(qkv_layout == "bshd_bshd_bshd"):
+        if qkv_layout == "bshd_bshd_bshd":
             layout = "bshd"
-        elif(qkv_layout == "thd_thd_thd"):
+        elif qkv_layout == "thd_thd_thd":
             layout = "thd"
         else:
-            raise AssertionError("block fp8 fa support only supports layouts in [bshd_bshd_bshd, thd_thd_thd]")
-        
+            raise AssertionError(
+                "block fp8 fa support only supports layouts in [bshd_bshd_bshd, thd_thd_thd]"
+            )
+        1206
         output, softmax_lse, exp_scores = attention_block_forward_triton_impl(
             q,
             k,
@@ -1226,7 +1228,7 @@ def fused_attn_fwd(
             True,
             use_fp8,
         )
-        print("use triton fa kernel forward")
+        # print("use triton fa kernel forward")
         return output, [softmax_lse, None]
     else:
         # execute kernel
@@ -1462,12 +1464,14 @@ def fused_attn_bwd(
             mask = True
         else:
             mask = False
-        if(qkv_layout == "bshd_bshd_bshd"):
+        if qkv_layout == "bshd_bshd_bshd":
             layout = "bshd"
-        elif(qkv_layout == "thd_thd_thd"):
+        elif qkv_layout == "thd_thd_thd":
             layout = "thd"
         else:
-            raise AssertionError("block fp8 fa support only supports layouts in [bshd_bshd_bshd, thd_thd_thd]")
+            raise AssertionError(
+                "block fp8 fa support only supports layouts in [bshd_bshd_bshd, thd_thd_thd]"
+            )
         output_tensors = attention_block_backward_triton_impl(
             d_o,
             q,
@@ -1495,7 +1499,7 @@ def fused_attn_bwd(
             True,  # sequence_parallel
         )
 
-        print("use triton fa kernel backward")
+        # print("use triton fa kernel backward")
 
     else:
         output_tensors = tex.fused_attn_bwd(
